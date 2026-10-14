@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Stand-in for HiveOS tools that need the physical machine: overclocking
+# (nvidia-oc, amd-oc, intel-oc), memory tweaks (tweakers) and fan control
+# (autofan). On a rented GPU the host owns clocks, power limits and fans, so
+# these do nothing and report success, letting HiveOS carry on normally.
+name=${0##*/}
+case $name in
+  nvidia-oc|amd-oc|intel-oc)
+    msg="$name: overclocking is not available on a rented GPU (the host controls clocks and power limits)" ;;
+  autofan)
+    msg="autofan: fans are controlled by the host" ;;
+  tweakers)
+    msg="tweakers: memory tweaks are not available on a rented GPU" ;;
+  *)
+    msg="$name: not available on a rented GPU" ;;
+esac
+# The dashboard shows the OC log after an OC change; leave the reason there.
+case $name in
+  nvidia-oc|amd-oc|intel-oc) echo "$msg" > "/var/log/$name.log" 2> /dev/null ;;
+esac
+[[ ${1:-} == quiet ]] || echo "$msg"
+exit 0

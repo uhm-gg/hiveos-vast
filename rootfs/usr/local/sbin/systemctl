@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# There is no systemd in this container. HiveOS calls systemctl for services
+# that don't exist here (X server, console, VPN, time sync...). Report every
+# unit as inactive/disabled and accept every other command without doing
+# anything, which is what HiveOS expects when such a service is absent.
+quiet=0
+for arg in "$@"; do
+  [[ $arg == -q || $arg == --quiet ]] && quiet=1
+done
+for arg in "$@"; do
+  case $arg in
+    is-active)          [[ $quiet -eq 1 ]] || echo inactive; exit 3 ;;
+    is-failed)          [[ $quiet -eq 1 ]] || echo inactive; exit 1 ;;
+    is-enabled)         [[ $quiet -eq 1 ]] || echo disabled; exit 1 ;;
+    is-system-running)  [[ $quiet -eq 1 ]] || echo offline;  exit 1 ;;
+    status)             exit 3 ;;
+  esac
+done
+exit 0

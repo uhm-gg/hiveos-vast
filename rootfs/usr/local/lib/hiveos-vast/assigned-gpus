@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# assigned-gpus: work out which NVIDIA PCI devices of the host are NOT assigned
+# to this container, and list them in $HIDDEN_PCI_FILE for the lspci wrapper.
+#
+# Inside a container, lspci shows every GPU installed in the host machine,
+# including cards rented to other people. HiveOS detects GPUs with lspci, so it
+# would count those too and report them as failed. The NVIDIA driver only shows
+# us our own cards, so anything it doesn't list gets hidden.
+real_lspci=${LSPCI_REAL:-/usr/bin/lspci}
+hidden_file=${HIDDEN_PCI_FILE:-/run/hiveos-vast/hidden-pci}
+mkdir -p "${hidden_file%/*}"
+rm -f "$hidden_file"
+
+# nvidia-smi bus IDs look like 00000000:41:00.0; lspci -D uses 0000:41:00.0.
+# Compare by slot (domain:bus:device) so a card's audio function goes with it.
+mapfile -t ours < <(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null |
+  tr 'A-F' 'a-f' |
+  sed -nE 's/^[[:space:]]*0*([0-9a-f]{0,4}):([0-9a-f]{2}):([0-9a-f]{2})\.[0-7].*/\1:\2:\3/p' |
+  awk -F: '{ printf "%04s:%s:%s\n", $1, $2, $3 }' | tr ' ' '0' | sort -u)
+
+if [[ ${#ours[@]} -eq 0 ]]; then
+  echo "no GPU visible through the NVIDIA driver, hiding nothing"
+  exit 0
+fi
+
+total=0
+hidden=0
+tmp=$(mktemp)
+while read -r addr _; do
+  [[ -z $addr ]] && continue
+  total=$((total + 1))
+  slot=${addr%.*}
+  keep=0
+  for s in "${ours[@]}"; do
+    [[ $slot == "$s" ]] && keep=1 && break
+  done
+  if [[ $keep -eq 0 ]]; then
+    echo "$addr" >> "$tmp"
+    hidden=$((hidden + 1))
+  fi
+done < <("$real_lspci" -Dn -d 10de: 2>/dev/null | awk '{ print tolower($1) }')
+
+if [[ -s $tmp ]]; then
+  mv "$tmp" "$hidden_file"
+else
+  rm -f "$tmp"
+fi
+echo "assigned GPU slots: ${ours[*]}; NVIDIA PCI functions in host: $total, hidden from HiveOS: $hidden"

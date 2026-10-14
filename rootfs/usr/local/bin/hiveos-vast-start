@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# hiveos-vast-start: boot the HiveOS client inside a container on a rented GPU.
+#
+# Replaces HiveOS's machine boot script (/hive/bin/hive), which expects a real
+# rig (systemd, kernel modules, X server, overclocking). Settings come from
+# environment variables, e.g. "-e FARM_HASH=..." in the Vast template:
+#
+#   FARM_HASH      Farm hash (HiveOS: Farm > Settings). Creates a worker
+#                  automatically on first start.
+#   RIG_ID         ID of a worker you created in HiveOS yourself ...
+#   RIG_PASSWD     ... and its password (use instead of FARM_HASH).
+#   WORKER_NAME    Name for a worker created with FARM_HASH
+#                  (default: vast-<Vast instance id>).
+#   HIVE_HOST_URL  HiveOS API server (default: http://api.hiveos.farm).
+#   LOG_MINER      1 (default) copies the miner console to the container log.
+#
+# Usage:
+#   hiveos-vast-start            start HiveOS and stay in the foreground
+#   hiveos-vast-start --check    check settings, GPUs and the API, start nothing
+#   hiveos-vast-start CMD...     run CMD instead (e.g. "bash")
+set -uo pipefail
+
+STATE_DIR=/run/hiveos-vast
+IDENTITY_FILE=/hive-config/.hiveos-vast-identity
+
+log()  { echo "[hiveos-vast] $*"; }
+warn() { echo "[hiveos-vast] WARNING: $*" >&2; }
+die()  { echo "[hiveos-vast] ERROR: $*" >&2; exit 1; }
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
+nocolor() { sed -u 's/\x1b\[[0-9;]*m//g'; }
+
+# Write KEY="value" lines that bash can source safely.
+conf_line() {
+  if [[ $2 =~ ^[A-Za-z0-9._@:/+=,-]*$ ]]; then
+    printf '%s="%s"\n' "$1" "$2"
+  else
+    printf '%s=%q\n' "$1" "$2"
+  fi
+}
+
+# Interruptible sleep, so "docker stop" is handled right away.
+pause() { sleep "$1" & wait $!; }
+
+check_only=0
+case "${1:-}" in
+  --check) check_only=1 ;;
+  "") ;;
+  *) exec "$@" ;;
+esac
+
+# HiveOS keeps its own settings (PATH, RIG_CONF, WALLET_CONF...) here.
+set -a
+# shellcheck disable=SC1091
+source /etc/environment
+set +a
+: "${RIG_CONF:=/hive-config/rig.conf}"
+: "${GPU_DETECT_JSON:=/run/hive/gpu-detect.json}"
+
+log "HiveOS client $(cat /etc/hiveos-version 2>/dev/null || echo '?') in a container"
+
+# --- Settings ----------------------------------------------------------------
+cfg_farm_hash=$(trim "${FARM_HASH:-}")
+# Lower-case rig_id/rig_pass are accepted too (the variable names Clore.ai uses).
+cfg_rig_id=$(trim "${RIG_ID:-${rig_id:-}}")
+cfg_rig_passwd=$(trim "${RIG_PASSWD:-${rig_pass:-}}")
+cfg_host_url=$(trim "${HIVE_HOST_URL:-http://api.hiveos.farm}")
+cfg_host_url=${cfg_host_url%/}
+instance_id=${CONTAINER_ID:-${VAST_CONTAINERLABEL:-}}
+instance_id=${instance_id#C.}
+cfg_worker_name=$(trim "${WORKER_NAME:-vast-${instance_id:-$(hostname)}}")
+# From here on HiveOS reads these from rig.conf only, as on a real rig, and
+# miners don't inherit them.
+unset FARM_HASH RIG_ID RIG_PASSWD WORKER_NAME HIVE_HOST_URL rig_id rig_pass
+
+if [[ -z $cfg_farm_hash && -z $cfg_rig_id ]]; then
+  die "no HiveOS credentials. Set FARM_HASH (HiveOS: Farm > Settings), or RIG_ID and RIG_PASSWD of an existing worker, as environment variables in the template."
+fi
+if [[ -n $cfg_rig_id && -z $cfg_rig_passwd ]]; then
+  die "RIG_ID is set but RIG_PASSWD is missing."
+fi
+if [[ -n $cfg_rig_id && ! $cfg_rig_id =~ ^[0-9]+$ ]]; then
+  warn "RIG_ID '$cfg_rig_id' is not a number; HiveOS worker IDs normally are."
+fi
+if [[ -n $cfg_farm_hash && ! $cfg_farm_hash =~ ^[0-9a-fA-F]{40}$ ]]; then
+  warn "FARM_HASH does not look like a 40-character HiveOS farm hash; check it if registration fails."
+fi
+
+if [[ -n $cfg_rig_id ]]; then
+  identity="rig:$cfg_rig_id"
+  log "Mode: existing worker (RIG_ID $cfg_rig_id)"
+else
+  identity="farm:$cfg_farm_hash"
+  log "Mode: FARM_HASH (on first start HiveOS creates a worker named '$cfg_worker_name')"
+fi
+identity_hash=$(printf '%s' "$identity" | sha256sum | cut -c1-16)
+
+# --- GPUs --------------------------------------------------------------------
+gpu_list=$(nvidia-smi -L 2>/dev/null) || gpu_list=
+if [[ -n $gpu_list ]]; then
+  log "GPUs assigned to this container:"
+  while IFS= read -r line; do log "  $line"; done <<< "$gpu_list"
+  log "NVIDIA driver $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)"
+else
+  warn "no NVIDIA GPU is visible in this container (only CPU mining can work)."
+fi
+
+if [[ $check_only -eq 1 ]]; then
+  http=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$cfg_host_url/worker/api") || http=
+  if [[ -n $http && $http != 000 ]]; then
+    log "HiveOS API $cfg_host_url is reachable (HTTP $http)"
+  else
+    warn "HiveOS API $cfg_host_url is NOT reachable from this container"
+  fi
+  log "--check finished: settings are valid, nothing was started"
+  exit 0
+fi
+
+stop() {
+  log "Stopping: miner, watchdog and agent"
+  wd stop > /dev/null 2>&1
+  miner stop > /dev/null 2>&1
+  agent-screen stop > /dev/null 2>&1
+  [[ -n ${tail_pid:-} ]] && kill "$tail_pid" 2> /dev/null
+  exit 0
+}
+trap stop TERM INT HUP
+
+# --- Clean state left by a previous run of this container --------------------
+# Unlike a real rig, /run survives a container restart, so stale miner flags
+# and dead screen sessions have to be cleared before HiveOS starts again.
+rm -rf /run/hive /run/screen/S-* "$STATE_DIR" 2>/dev/null
+mkdir -p /run/hive "$STATE_DIR" /hive-config /var/log/miner /home/user/.cache
+cp -rn /hive/etc/hive-config.stub/. /hive-config/ 2>/dev/null
+
+# --- Rig config ----------------------------------------------------------------
+# After the first successful start HiveOS rewrites rig.conf with the worker's
+# real ID and password. Keep it on restarts so FARM_HASH doesn't create a new
+# worker every time the instance restarts.
+if [[ -f $RIG_CONF && -f $IDENTITY_FILE && "$(< "$IDENTITY_FILE")" == "$identity_hash" ]] \
+   && grep -qE '^RIG_ID="?[0-9]+' "$RIG_CONF"; then
+  log "Re-using the worker from a previous start ($(grep -m1 -oE '^RIG_ID="?[0-9]+' "$RIG_CONF" | tr -d '"'))"
+else
+  {
+    echo "# Written by hiveos-vast-start; HiveOS replaces it after the first connection."
+    conf_line HIVE_HOST_URL "$cfg_host_url"
+    if [[ -n $cfg_rig_id ]]; then
+      conf_line RIG_ID "$cfg_rig_id"
+      conf_line RIG_PASSWD "$cfg_rig_passwd"
+    else
+      conf_line FARM_HASH "$cfg_farm_hash"
+      conf_line WORKER_NAME "$cfg_worker_name"
+      [[ -n $cfg_rig_passwd ]] && conf_line RIG_PASSWD "$cfg_rig_passwd"
+    fi
+  } > "$RIG_CONF"
+  chmod 600 "$RIG_CONF"
+  echo "$identity_hash" > "$IDENTITY_FILE"
+fi
+
+# --- Hardware view for HiveOS --------------------------------------------------
+# lspci in a container lists every GPU in the host, including cards rented by
+# other people; hide the ones not assigned to us so HiveOS counts only ours.
+log "PCI: $(/usr/local/lib/hiveos-vast/assigned-gpus)"
+# Link HiveOS's CUDA runtime (libcudart, libnvrtc) to the host driver's version.
+nvidia-driver-update --cuda 2>&1 | nocolor | sed 's/^/[hiveos-vast] cuda: /'
+gpu-detect listjson > "$GPU_DETECT_JSON" 2>/dev/null
+log "HiveOS sees $(gpu-detect NVIDIA 2>/dev/null || echo 0) NVIDIA GPU(s)"
+
+crontab /hive/etc/crontab.root
+cron
+
+# --- Connect to HiveOS ---------------------------------------------------------
+# "hello" registers the worker (FARM_HASH) or logs it in, and downloads its
+# configuration (flight sheet, wallet). Network problems are retried forever;
+# a rejection by the API (bad hash or password) stops the container.
+#
+# "check" stops hello from scheduling its own background retry: two retry loops
+# racing could register the same FARM_HASH worker twice.
+#
+# hello also gathers machine details a container doesn't have (/dev/mem, boot
+# disk, systemd network files, AMD driver); those messages are just noise here.
+hello_noise='/dev/mem: No such file|/run/systemd/resolve/resolv.conf|/etc/systemd/network/|substring expression < 0|modinfo: ERROR: Module alias'
+attempt=0
+while true; do
+  attempt=$((attempt + 1))
+  log "Connecting to HiveOS ($cfg_host_url), attempt $attempt"
+  out=$(hello boot check nocolor 2>&1)
+  code=$?
+  out=$(nocolor <<< "$out" | grep -vE "$hello_noise")
+  printf '%s\n' "$out" | sed 's/^/[hiveos-vast] hello: /'
+  [[ $code -eq 0 ]] && break
+  # API rejections print "ERROR: <message from HiveOS>" and exit 1.
+  if [[ $code -eq 1 ]] && grep -qE '^ERROR: ' <<< "$out" \
+     && ! grep -qiE 'connection to API server failed|parsing JSON failed|no config field' <<< "$out"; then
+    die "HiveOS rejected this worker's credentials (see the message above). Check FARM_HASH, or RIG_ID and RIG_PASSWD."
+  fi
+  delay=$(( attempt < 6 ? attempt * 10 : 60 ))
+  warn "could not reach HiveOS; retrying in ${delay}s"
+  pause "$delay"
+done
+
+set -a
+# shellcheck disable=SC1090
+source "$RIG_CONF"
+set +a
+log "Connected as worker '${WORKER_NAME:-?}' (RIG_ID ${RIG_ID:-?})"
+
+cache-hive-ip nocolor > /dev/null 2>&1
+log "Starting the HiveOS agent"
+agent-screen start > /dev/null 2>&1
+if [[ ${MAINTENANCE:-0} == 1 || ${MAINTENANCE:-0} == 2 ]]; then
+  log "Worker is in maintenance mode in HiveOS: miner not started"
+else
+  log "Starting the miner from the worker's flight sheet"
+  miner start 2>&1 | nocolor | sed 's/^/[hiveos-vast] miner: /'
+fi
+wd start > /dev/null 2>&1
+log "HiveOS is running. Control the miner from your HiveOS dashboard."
+
+# --- Logs ------------------------------------------------------------------------
+touch /var/log/hive-agent.log
+log_files=(/var/log/hive-agent.log)
+if [[ ${LOG_MINER:-1} != 0 ]]; then
+  touch /run/hive/miner.1
+  log_files+=(/run/hive/miner.1)
+fi
+tail -n0 -F "${log_files[@]}" 2> /dev/null &
+tail_pid=$!
+
+while true; do
+  pause 3600
+done

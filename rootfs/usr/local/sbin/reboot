@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# A rented container can't reboot the host: restart the HiveOS services instead.
+exec /hive/sbin/sreboot

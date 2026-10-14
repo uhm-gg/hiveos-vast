@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# lspci wrapper: hides the host's NVIDIA devices that are not assigned to this
+# container (listed by /usr/local/lib/hiveos-vast/assigned-gpus at startup),
+# so HiveOS only counts the GPUs actually rented. Without that list it is
+# plain lspci.
+real=${LSPCI_REAL:-/usr/bin/lspci}
+hidden_file=${HIDDEN_PCI_FILE:-/run/hiveos-vast/hidden-pci}
+
+[[ -s $hidden_file ]] || exec "$real" "$@"
+
+# Tree view can't be filtered line by line; show it unchanged.
+for arg in "$@"; do
+  [[ $arg == -t* ]] && exec "$real" "$@"
+done
+
+# Verbose formats (-v, -vv, -vmm, -vnns ...) print one block per device,
+# separated by blank lines; the others print one line per device.
+blocks=0
+for arg in "$@"; do
+  [[ $arg == -* && $arg != --* && $arg == *v* ]] && blocks=1
+done
+
+"$real" "$@" | awk -v hidden_file="$hidden_file" -v blocks="$blocks" '
+  function full(a) {
+    a = tolower(a)
+    if (split(a, p, ":") == 2) a = "0000:" a
+    return a
+  }
+  BEGIN {
+    while ((getline line < hidden_file) > 0)
+      if (line != "") hide[tolower(line)] = 1
+    if (blocks) { RS = ""; ORS = "\n\n" }
+  }
+  # Indented lines (lspci -k) belong to the device above them.
+  !blocks && /^[ \t]/ { if (!skip) print; next }
+  {
+    addr = $1
+    if (blocks && $1 == "Slot:") addr = $2
+    skip = (full(addr) in hide)
+    if (!skip) print
+  }
+'

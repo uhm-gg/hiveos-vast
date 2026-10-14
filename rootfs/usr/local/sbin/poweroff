@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# A rented container can't power off the host: stop the miner instead.
+# (shutdown and halt are links to this script.) To really stop paying for the
+# GPU, stop or destroy the instance in the Vast console.
+exec /hive/sbin/sreboot shutdown

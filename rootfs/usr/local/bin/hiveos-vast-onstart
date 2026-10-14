@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# hiveos-vast-onstart: start HiveOS from a Vast "On-start Script".
+#
+# In Vast's "SSH" and "Jupyter" launch modes Vast replaces the image's
+# entrypoint with its own setup, so HiveOS has to be started from the template's
+# On-start Script. Put this one line there:
+#
+#     /usr/local/bin/hiveos-vast-onstart
+#
+# It starts hiveos-vast-start in the background (logging to
+# /var/log/hiveos-vast.log) and returns at once, so SSH setup isn't held up.
+#
+# Do NOT add "env >> /etc/environment" to the on-start script with this image:
+# /etc/environment is HiveOS's own settings file, and appending the container's
+# variables to it breaks HiveOS and copies your credentials into it.
+LOG=/var/log/hiveos-vast.log
+
+if pgrep -f 'bash /usr/local/bin/hiveos-vast-start$' > /dev/null; then
+  echo "[hiveos-vast] already running (log: $LOG)"
+  exit 0
+fi
+
+nohup /usr/local/bin/hiveos-vast-start >> "$LOG" 2>&1 < /dev/null &
+echo "[hiveos-vast] HiveOS is starting in the background. Follow it with: tail -f $LOG"

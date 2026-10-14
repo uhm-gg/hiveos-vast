@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# No bootloader in a container; HiveOS's selfupgrade calls this when its grub
+# settings change. Nothing to do.
+exit 0

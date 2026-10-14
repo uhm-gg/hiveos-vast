@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Container version of HiveOS's nvidia-driver-update. On a rented GPU the
+# NVIDIA driver belongs to the host and can't be installed or changed here.
+#
+# Only --cuda is passed through to HiveOS's original (nvidia-driver-update.hive):
+# it links /hive/lib/libcudart.so, libnvrtc.so and libnvrtc-builtins.so to the
+# CUDA runtime that matches the host's driver. Some miners (T-Rex, for one) load
+# these by name, so they must exist.
+case ${1:-} in
+  -c|--cuda)
+    exec /hive/sbin/nvidia-driver-update.hive --cuda ;;
+  *)
+    echo "nvidia-driver-update: the NVIDIA driver is provided by the host of this rented GPU and can't be changed from the container (only --cuda is available)."
+    exit 0 ;;
+esac

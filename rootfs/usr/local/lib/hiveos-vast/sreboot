@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Container version of HiveOS's sreboot. A rented container can't reboot or
+# power off the host, so:
+#   reboot   (dashboard "Reboot", watchdog)  -> restart the HiveOS miner and agent
+#   shutdown (dashboard "Shutdown")          -> stop the miner and the watchdog
+#
+# Restarts are rate-limited so a watchdog loop can't restart the miner over and
+# over. Inside a container the load average is the whole host's, so the
+# watchdog's high-load "reboot" (sreboot fast) gets a longer limit.
+set -a
+# shellcheck disable=SC1091
+source /etc/environment
+set +a
+
+STATE_DIR=/run/hiveos-vast
+LOG=/var/log/hiveos-vast.log
+mkdir -p "$STATE_DIR"
+
+say() {
+  local line
+  line="[hiveos-vast] $(date '+%F %T') sreboot: $*"
+  echo "$line"
+  echo "$line" >> "$LOG" 2> /dev/null
+  # Also put it in the container log (PID 1's output), unless that's where
+  # our output goes already. The agent runs sreboot with output discarded.
+  if [[ -w /proc/1/fd/1 && "$(readlink /proc/1/fd/1)" != "$(readlink "/proc/$$/fd/1")" ]]; then
+    echo "$line" > /proc/1/fd/1 2> /dev/null
+  fi
+}
+
+case ${1:-} in
+  -h|--help)
+    echo "sreboot (container): 'sreboot' restarts the HiveOS miner and agent; 'sreboot shutdown' stops the miner."
+    exit 0 ;;
+  shutdown|wakealarm)
+    say "shutdown requested: stopping the miner (a rented container can't power off the host)"
+    wd stop > /dev/null 2>&1
+    miner stop > /dev/null 2>&1
+    exit 0 ;;
+esac
+
+reason=${1:-reboot}
+if [[ $reason == fast ]]; then
+  min_gap=${HIVEOS_VAST_LA_RESTART_GAP:-900}
+else
+  min_gap=${HIVEOS_VAST_RESTART_GAP:-60}
+fi
+now=$(date +%s)
+last=$(cat "$STATE_DIR/last-restart" 2> /dev/null || echo 0)
+if (( now - last < min_gap )); then
+  say "reboot requested ($reason), but HiveOS was restarted $((now - last))s ago; skipping (limit ${min_gap}s)"
+  exit 0
+fi
+echo "$now" > "$STATE_DIR/last-restart"
+
+[[ $reason == fast ]] && say "note: the watchdog's load-average check sees the whole host's load inside a container"
+say "reboot requested ($reason): restarting the HiveOS miner and agent instead"
+miner restart > /dev/null 2>&1
+agent-screen restart > /dev/null 2>&1
+exit 0

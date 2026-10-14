@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# lsmod for containers. HiveOS runs "lsmod | grep ^nvidia" to decide whether
+# the NVIDIA driver is loaded, and disables every NVIDIA GPU if it isn't
+# listed. The kernel's module list isn't always readable from a container, but
+# when the NVIDIA device nodes are present the host's driver is clearly loaded,
+# so report the module in that case.
+out=$(/usr/bin/kmod list 2> /dev/null) || out=
+[[ -n $out ]] || out="Module                  Size  Used by"
+printf '%s\n' "$out"
+if ! grep -q '^nvidia ' <<< "$out" && [[ -e /dev/nvidiactl || -e /proc/driver/nvidia/version ]]; then
+  printf '%-24s%8s  %s\n' nvidia 0 0
+fi
